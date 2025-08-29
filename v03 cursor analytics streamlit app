@@ -1,0 +1,612 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime, time, timezone
+from typing import Optional, List, Dict, Set
+import json, hashlib
+from uuid import uuid4
+
+from cognite.client import CogniteClient
+from cognite.client.exceptions import CogniteAPIError
+
+# --- Try to import a RAW Row class (SDK variants) ---
+RawRowClass = None
+try:
+    from cognite.client.data_classes.raw import RawRow as RawRowClass
+except Exception:
+    try:
+        from cognite.client.data_classes.raw import Row as RawRowClass
+    except Exception:
+        RawRowClass = None  # we'll fallback to dict rows if accepted
+
+st.title("Cursor Analytics → Org Rollups")
+st.caption("RAW sources: **cursor analytics** / **bamboo-hr**")
+
+client = CogniteClient()
+
+# === Config ===
+AN_DB = "cursor analytics"
+EMP_DB = "bamboo-hr"
+EMP_TABLE = "employees"
+UPLOAD_TABLE = "cursor_analytics_raw_data"  # Target for uploads (RAW/Staging)
+
+# ---------- RAW helpers (SDK-compatible pagination) ----------
+def _list_rows_page(db: str, table: str, limit: int, cursor: Optional[str]):
+    try:
+        page = client.raw.rows.list(db_name=db, table_name=table, limit=limit, cursor=cursor)
+        return page, getattr(page, "next_cursor", None)
+    except TypeError:
+        page = client.raw.rows.list(db_name=db, table_name=table, limit=limit)
+        return page, None
+
+def _list_tables_page(db: str, limit: int, cursor: Optional[str]):
+    try:
+        page = client.raw.tables.list(db_name=db, limit=limit, cursor=cursor)
+        return page, getattr(page, "next_cursor", None)
+    except TypeError:
+        page = client.raw.tables.list(db_name=db, limit=limit)
+        return page, None
+
+def _ensure_table_exists(db: str, table: str) -> None:
+    # Check first
+    cursor = None
+    while True:
+        page, cursor = _list_tables_page(db, limit=1000, cursor=cursor)
+        if any(t.name == table for t in page):
+            return
+        if not cursor:
+            break
+    # Create (handle SDK variants)
+    try:
+        client.raw.tables.create(db_name=db, name=table)
+    except TypeError:
+        try:
+            client.raw.tables.create(db, table)
+        except CogniteAPIError as e:
+            if getattr(e, "code", None) not in (409,) and "exist" not in str(e).lower():
+                raise
+    except CogniteAPIError as e:
+        if getattr(e, "code", None) not in (409,) and "exist" not in str(e).lower():
+            raise
+
+def _insert_rows(db: str, table: str, rows: List):
+    """Insert a list of Row objects (or dicts in SDKs that accept them)."""
+    try:
+        client.raw.rows.insert(db_name=db, table_name=table, rows=rows)
+    except TypeError:
+        client.raw.rows.insert(db, table, rows)
+
+# ---------- Utilities ----------
+def _norm_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+def _safe_int(x, default=0):
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+def _to_epoch_ms(value) -> Optional[int]:
+    """Convert Date field (str/float/int/ISO) to epoch ms; returns None if not parsable."""
+    if value is None:
+        return None
+    try:
+        s = str(value).strip().replace(",", "")
+        if s == "":
+            return None
+        x = float(s)
+        if x >= 1e12:            # already ms
+            return int(x)
+        if x >= 1e10:            # seconds
+            return int(x * 1000)
+    except Exception:
+        pass
+    try:
+        dt = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return int(dt.value // 10**6)  # ns -> ms
+    except Exception:
+        return None
+
+def _utc_day_bounds(d):
+    """UTC bounds inclusive: start 00:00:00, end 23:59:59."""
+    start_dt = datetime.combine(d, time(0, 0, 0, tzinfo=timezone.utc))
+    end_dt = datetime.combine(d, time(23, 59, 59, tzinfo=timezone.utc))
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+def _fmt_utc(ms: Optional[int]) -> str:
+    """Show only YYYY-MM-DD."""
+    if ms is None:
+        return "—"
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+def show(df: pd.DataFrame):
+    """Display without the left index."""
+    try:
+        st.dataframe(df.style.hide(axis="index"), use_container_width=True)
+    except Exception:
+        st.dataframe(df.reset_index(drop=True), use_container_width=True)
+
+# Helpers to read from Row or dict forms safely
+def _row_key(obj):
+    if hasattr(obj, "key"):
+        return obj.key
+    if isinstance(obj, dict):
+        return obj.get("key")
+    return None
+
+def _row_columns(obj):
+    if hasattr(obj, "columns"):
+        return obj.columns
+    if isinstance(obj, dict):
+        return obj.get("columns", {})
+    return {}
+
+# ---------- Dedup canonicalization/signatures (ignore 'key' column) ----------
+_CANON_SUGG = "Chat Suggested Lines Added"
+_CHATT_SUGG = "Chatt Suggested Lines Added"
+
+def _canonicalize_cols(cols: dict) -> dict:
+    """
+    Normalized view for dedup:
+    - drop 'key'
+    - Email lowercased
+    - unify 'Chatt Suggested...' -> 'Chat Suggested Lines Added'
+    - Date normalized to epoch ms
+    - Suggested/Accepted coerced to int
+    - all other columns included as-is
+    """
+    out = {}
+    for k, v in (cols or {}).items():
+        if k == "key":
+            continue
+        ck = _CANON_SUGG if k == _CHATT_SUGG else k
+        if ck == "Email":
+            out[ck] = _norm_email(v)
+        elif ck == "Date":
+            out[ck] = _to_epoch_ms(v)
+        elif ck in (_CANON_SUGG, "Chat Accepted Lines Added"):
+            out[ck] = _safe_int(v)
+        else:
+            out[ck] = v
+    if _CANON_SUGG not in out and _CHATT_SUGG in cols:
+        out[_CANON_SUGG] = _safe_int(cols.get(_CHATT_SUGG))
+    return out
+
+def _content_signature_from_cols(cols: dict) -> str:
+    payload = _canonicalize_cols(cols)
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+def _content_signature_from_csv_row(r, all_cols: List[str]) -> str:
+    cols = {c: (None if pd.isna(r[c]) else r[c]) for c in all_cols if c != "key"}
+    return _content_signature_from_cols(cols)
+
+def _existing_signatures_subset(table: str, candidate_sigs: Set[str], page_limit: int = 10000) -> Set[str]:
+    """Scan table, compute signatures from row.columns (ignoring 'key'), return subset present."""
+    found: Set[str] = set()
+    if not candidate_sigs:
+        return found
+    cursor = None
+    while True:
+        page, cursor = _list_rows_page(AN_DB, table, limit=page_limit, cursor=cursor)
+        for row in page:
+            sig = _content_signature_from_cols(row.columns or {})
+            if sig in candidate_sigs:
+                found.add(sig)
+                if len(found) == len(candidate_sigs):
+                    return found
+        if not cursor:
+            break
+    return found
+
+# ---------- Data loaders for analysis ----------
+@st.cache_data(show_spinner=False)
+def _load_employees_lookup():
+    """
+    email -> {division, department, location}
+    Maps by both row.key and columns['work_email'] when present.
+    """
+    lookup: Dict[str, Dict[str, Optional[str]]] = {}
+    page, _ = _list_rows_page(EMP_DB, EMP_TABLE, limit=10000, cursor=None)
+    for row in page:
+        cols = row.columns or {}
+        emails = {_norm_email(row.key), _norm_email(cols.get("work_email"))}
+        payload = {"division": cols.get("division"), "department": cols.get("department"), "location": cols.get("location")}
+        for e in emails:
+            if not e:
+                continue
+            existing = lookup.get(e, {})
+            lookup[e] = {
+                "division": existing.get("division") or payload.get("division"),
+                "department": existing.get("department") or payload.get("department"),
+                "location": existing.get("location") or payload.get("location"),
+            }
+    return lookup
+
+@st.cache_data(show_spinner=True)
+def _list_analytics_tables() -> list[str]:
+    names: List[str] = []
+    cursor = None
+    while True:
+        page, cursor = _list_tables_page(AN_DB, limit=1000, cursor=cursor)
+        for t in page:
+            names.append(t.name)
+        if not cursor:
+            break
+    return sorted(names)
+
+@st.cache_data(show_spinner=True)
+def _load_analytics_in_range(table: str, epoch_ms_start: int, epoch_ms_end: int, page_limit: int = 10000):
+    """
+    Stream analytics rows in [start,end] by Date (epoch ms).
+    Returns list of dicts with normalized fields for analysis.
+    """
+    results = []
+    cursor = None
+    while True:
+        page, cursor = _list_rows_page(AN_DB, table, limit=page_limit, cursor=cursor)
+        for row in page:
+            cols = row.columns or {}
+            # Suggested value
+            if _CANON_SUGG in cols:
+                sugg_val = _safe_int(cols.get(_CANON_SUGG))
+            elif _CHATT_SUGG in cols:
+                sugg_val = _safe_int(cols.get(_CHATT_SUGG))
+            else:
+                sugg_val = 0
+            # Date (robust parse)
+            date_ms = _to_epoch_ms(cols.get("Date"))
+            if date_ms is None:
+                continue
+            if epoch_ms_start <= date_ms <= epoch_ms_end:
+                results.append({
+                    "email": _norm_email(cols.get("Email")),
+                    "date_ms": date_ms,
+                    "suggested": sugg_val,
+                    "accepted": _safe_int(cols.get("Chat Accepted Lines Added")),
+                })
+        if not cursor:
+            break
+    return results
+
+# NEW: global date bounds for UPLOAD_TABLE (min/max Date)
+@st.cache_data(show_spinner=False)
+def _get_table_date_bounds(db: str, table: str, page_limit: int = 10000):
+    """
+    Return (min_ms, max_ms) for Date in given RAW table.
+    If table is missing or has no valid Date values, returns (None, None).
+    """
+    min_ms, max_ms = None, None
+    cursor = None
+    while True:
+        try:
+            page, cursor = _list_rows_page(db, table, limit=page_limit, cursor=cursor)
+        except CogniteAPIError as e:
+            if getattr(e, "code", None) == 404:
+                return None, None
+            raise
+        for row in page:
+            cols = row.columns or {}
+            ms = _to_epoch_ms(cols.get("Date"))
+            if ms is None:
+                continue
+            if min_ms is None or ms < min_ms:
+                min_ms = ms
+            if max_ms is None or ms > max_ms:
+                max_ms = ms
+        if not cursor:
+            break
+    return min_ms, max_ms
+
+# ---------- Upload helpers ----------
+def _row_from_cols(raw_key: str, columns: dict):
+    """Create a Row object if possible; otherwise return a dict (for SDKs that accept dicts)."""
+    if RawRowClass is not None:
+        return RawRowClass(key=raw_key, columns=columns)
+    return {"key": raw_key, "columns": columns}
+
+def _rows_from_csv_for_upload(df: pd.DataFrame) -> List:
+    """
+    Build rows for insertion:
+      - RAW row key = content signature over all columns except 'key'
+      - columns = all CSV columns (+ ensure 'key' UUID)
+    """
+    required = {"Email", "Date", "Chat Accepted Lines Added"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns: {sorted(missing)}")
+
+    rows: List = []
+    for _, r in df.iterrows():
+        email = str(r.get("Email") or "").strip()
+        date_ms = _to_epoch_ms(r.get("Date"))
+        if not email or date_ms is None:
+            continue
+
+        sig = _content_signature_from_csv_row(r, df.columns.tolist())
+        cols = {c: (None if pd.isna(r[c]) else r[c]) for c in df.columns}
+        if "key" not in cols or not cols["key"]:
+            cols["key"] = str(uuid4())  # separate UUID column (not the RAW row key)
+
+        rows.append(_row_from_cols(sig, cols))
+    return rows
+
+def _insert_chunked(rows: List, chunk: int = 1000):
+    for i in range(0, len(rows), chunk):
+        _insert_rows(AN_DB, UPLOAD_TABLE, rows[i : i + chunk])
+
+# =========================
+#              TABS
+# =========================
+tab_analyze, tab_graph, tab_upload = st.tabs(["Analyze Cursor Data", "Graph", "Upload Data"])
+
+# ---------- Analyze Cursor Data (default tab) ----------
+with tab_analyze:
+    # Show current date range present in cursor_analytics_raw_data
+    try:
+        min_ms, max_ms = _get_table_date_bounds(AN_DB, UPLOAD_TABLE)
+    except Exception:
+        min_ms, max_ms = None, None
+    st.markdown(
+        f"**Current data window in `{UPLOAD_TABLE}`**: "
+        f"{_fmt_utc(min_ms)} → {_fmt_utc(max_ms)}"
+    )
+
+    emp_lookup = _load_employees_lookup()
+
+    divisions_set = {v.get("division") for v in emp_lookup.values() if v.get("division")}
+    division_options = ["All Divisions"] + sorted(divisions_set)
+    selected_division = st.selectbox("Filter by Division", options=division_options, index=0)
+
+    all_tables = _list_analytics_tables()
+    if not all_tables:
+        st.error(f"No RAW tables found in database '{AN_DB}'.")
+        st.stop()
+    default_idx = all_tables.index(UPLOAD_TABLE) if UPLOAD_TABLE in all_tables else 0
+    an_table = st.selectbox("Analytics RAW table (from 'cursor analytics')", options=all_tables, index=default_idx)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input("Start date (UTC 00:00:00)", value=datetime.utcnow().date())
+    with c2:
+        end_date = st.date_input("End date (UTC 23:59:59)", value=datetime.utcnow().date())
+
+    if start_date > end_date:
+        st.error("Start date must be on or before End date.")
+        st.stop()
+
+    start_ms, _ = _utc_day_bounds(start_date)
+    _, end_ms = _utc_day_bounds(end_date)
+
+    run = st.button("Run rollup", type="primary")
+
+    if run:
+        with st.spinner("Loading analytics in date range…"):
+            try:
+                rows = _load_analytics_in_range(an_table, start_ms, end_ms)
+            except CogniteAPIError as e:
+                st.error(f"Failed reading RAW analytics: {e}")
+                st.stop()
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                st.stop()
+
+        if not rows:
+            st.info("No analytics rows found in the selected date range.")
+            st.stop()
+
+        # Per-user totals
+        df = pd.DataFrame(rows)
+        df = df[df["email"].notna() & (df["email"] != "")]
+        per_user = (
+            df.groupby("email", as_index=False)[["suggested", "accepted"]]
+              .sum()
+              .sort_values(["suggested", "accepted"], ascending=False)
+        )
+
+        # Attach org info
+        per_user["division"]   = per_user["email"].map(lambda e: (emp_lookup.get(e, {}) or {}).get("division"))
+        per_user["department"] = per_user["email"].map(lambda e: (emp_lookup.get(e, {}) or {}).get("department"))
+        per_user["location"]   = per_user["email"].map(lambda e: (emp_lookup.get(e, {}) or {}).get("location"))
+
+        # Apply Division filter
+        if selected_division != "All Divisions":
+            per_user = per_user[per_user["division"] == selected_division]
+
+        if per_user.empty:
+            st.info("No data after applying the Division filter.")
+            st.stop()
+
+        # Rollups
+        def rollup(by_col: str):
+            tmp = per_user.copy()
+            tmp[by_col] = tmp[by_col].fillna("—")
+            g = tmp.groupby(by_col, as_index=False)[["suggested", "accepted"]].sum()
+            g = g.sort_values(["suggested", "accepted"], ascending=False)
+            g.columns = [by_col.capitalize(), "Suggested total", "Accepted total"]
+            return g
+
+        div_tbl = rollup("division")
+        dep_tbl = rollup("department")
+        loc_tbl = rollup("location")
+
+        st.success("Done. Rollups below.")
+
+        st.subheader("By Division")
+        show(div_tbl)
+
+        st.subheader("By Department")
+        show(dep_tbl)
+
+        st.subheader("By Location")
+        show(loc_tbl)
+
+        with st.expander("Per-user totals (joined with org info)"):
+            pretty_user = per_user[["email", "division", "department", "location", "suggested", "accepted"]]
+            pretty_user.columns = ["Email", "Division", "Department", "Location", "Suggested total", "Accepted total"]
+            pretty_user = pretty_user.sort_values(["Suggested total", "Accepted total"], ascending=False)
+            show(pretty_user)
+
+        # Top 20 by Accepted total (only that metric)
+        top20 = (
+            per_user.sort_values(["accepted"], ascending=False)
+                    .head(20)[["email", "division", "department", "location", "accepted"]]
+                    .rename(columns={
+                        "email": "Email",
+                        "division": "Division",
+                        "department": "Department",
+                        "location": "Location",
+                        "accepted": "Accepted total",
+                    })
+        )
+        st.subheader("Top 20 contributors (by Accepted total)")
+        show(top20)
+
+        st.caption(
+            "Date filter uses UTC inclusive day bounds: 00:00:00 → 23:59:59. "
+            "Division filter updates all tables. Index hidden in all tables."
+        )
+
+# ---------- Graph tab ----------
+with tab_graph:
+    st.subheader("Weekly Trends by Department")
+    st.caption("Select a table and date range. Lines show department totals, aggregated by week (UTC).")
+
+    emp_lookup = _load_employees_lookup()
+
+    all_tables = _list_analytics_tables()
+    if not all_tables:
+        st.error(f"No RAW tables found in database '{AN_DB}'.")
+        st.stop()
+    default_idx = all_tables.index(UPLOAD_TABLE) if UPLOAD_TABLE in all_tables else 0
+    graph_table = st.selectbox("Analytics RAW table", options=all_tables, index=default_idx)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        g_start_date = st.date_input("Start date (UTC 00:00:00)", key="g_start", value=datetime.utcnow().date())
+    with g2:
+        g_end_date = st.date_input("End date (UTC 23:59:59)", key="g_end", value=datetime.utcnow().date())
+
+    if g_start_date > g_end_date:
+        st.error("Start date must be on or before End date.")
+        st.stop()
+
+    g_start_ms, _ = _utc_day_bounds(g_start_date)
+    _, g_end_ms = _utc_day_bounds(g_end_date)
+
+    draw = st.button("Draw graphs", type="primary", key="draw_graphs")
+
+    if draw:
+        with st.spinner("Loading and aggregating…"):
+            try:
+                rows = _load_analytics_in_range(graph_table, g_start_ms, g_end_ms)
+            except CogniteAPIError as e:
+                st.error(f"Failed reading RAW analytics: {e}")
+                st.stop()
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                st.stop()
+
+            if not rows:
+                st.info("No analytics rows found in the selected date range.")
+                st.stop()
+
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("No data to plot.")
+                st.stop()
+
+            # Map to department
+            df["department"] = df["email"].map(lambda e: (emp_lookup.get(e, {}) or {}).get("department")).fillna("—")
+
+            # Week start (UTC, Monday-based), make naive for clean axis
+            dt_index = pd.to_datetime(df["date_ms"], unit="ms", utc=True)
+            week = dt_index.dt.to_period("W-MON").apply(lambda p: p.start_time)
+            df["week_start"] = week.dt.tz_localize(None)
+
+            agg = df.groupby(["week_start", "department"], as_index=False)[["suggested", "accepted"]].sum()
+            agg = agg.sort_values("week_start")
+
+            # Plot with Streamlit line_chart (no external deps)
+            def plot_metric(metric: str, title: str):
+                pivot = agg.pivot(index="week_start", columns="department", values=metric).fillna(0).sort_index()
+                st.markdown(f"### {title}")
+                st.line_chart(pivot, use_container_width=True)
+
+            plot_metric("suggested", "Weekly Suggested Lines by Department")
+            plot_metric("accepted", "Weekly Accepted Lines by Department")
+
+# ---------- Upload Data ----------
+with tab_upload:
+    st.subheader("Upload CSV to RAW/Staging")
+    st.caption(
+        f"Target: RAW DB **{AN_DB}**, Table **{UPLOAD_TABLE}**. "
+        f"CSV must include at least: Email, Date, Chat Accepted Lines Added. "
+        f"Dedup compares ALL columns except 'key' (typo 'Chatt Suggested...' is unified). "
+        f"A UUID is generated for the 'key' column; RAW row key is a content signature."
+    )
+
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+    if uploaded is not None:
+        try:
+            df_csv = pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            st.stop()
+
+        st.write("CSV preview:")
+        show(df_csv.head(10))
+
+        if st.button("Upload & de-duplicate", type="primary"):
+            try:
+                with st.spinner("Ensuring RAW table exists…"):
+                    _ensure_table_exists(AN_DB, UPLOAD_TABLE)
+
+                rows_all = _rows_from_csv_for_upload(df_csv)
+                if not rows_all:
+                    st.warning("No valid rows found in the CSV (need Email and Date).")
+                    st.stop()
+
+                # Build candidate signatures (row keys)
+                candidate_sigs = {_row_key(r) for r in rows_all}
+
+                with st.spinner("Checking existing datapoints (by content signature)…"):
+                    present = _existing_signatures_subset(UPLOAD_TABLE, candidate_sigs)
+
+                # Filter rows to insert
+                to_insert = [r for r in rows_all if _row_key(r) not in present]
+
+                if not to_insert:
+                    st.info("All datapoints from this CSV are already present (by content). Nothing to insert.")
+                else:
+                    with st.spinner(f"Inserting {len(to_insert)} new rows…"):
+                        _insert_chunked(to_insert, chunk=1000)
+
+                    # Clear caches so new table/rows appear immediately in Analyze/Graph tabs
+                    st.cache_data.clear()
+
+                    st.success(
+                        f"Upload complete. Inserted {len(to_insert)} new rows. "
+                        f"Skipped {len(present)} duplicates."
+                    )
+
+                    st.write("Sample of inserted rows (columns only):")
+                    sample_df = pd.DataFrame([_row_columns(r) for r in to_insert[:20]])
+                    show(sample_df)
+
+                    # Immediately refresh so headers pick up new bounds
+                    try:
+                        st.rerun()
+                    except Exception:
+                        try:
+                            st.experimental_rerun()
+                        except Exception:
+                            pass
+
+            except CogniteAPIError as e:
+                st.error(f"CDF API error: {e}")
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Unexpected error during upload: {e}")
